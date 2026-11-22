@@ -1,0 +1,634 @@
+import Docker from "dockerode";
+import path from "path";
+import fs from "fs";
+import net from "net";
+import { getImageForWorkspace } from "./imageResolver.js";
+import {
+  registerContainer,
+  getContainerEntry,
+  touchContainer,
+  removeContainer,
+  getAllContainers,
+} from "./containerRegistry.js";
+import User from "../models/User.js";
+import { getWorkspacesRoot } from "../config/paths.js";
+
+const docker = new Docker();
+
+export function getContainerKey(userId, workspaceId) {
+  return `${userId}-${workspaceId}`;
+}
+
+export function getSanitizedContainerName(workspaceKey) {
+  return `vocodeai-${workspaceKey.replace(/[^a-zA-Z0-9_.-]/g, "_")}`;
+}
+
+export async function configureContainerEnvironment(container, workspaceKey) {
+  try {
+    let gitUser = "";
+    let gitEmail = "";
+    let gitCreds = "";
+
+    if (workspaceKey) {
+      try {
+        const userId = workspaceKey.split("-")[0];
+        const user = await User.findById(userId).lean();
+        if (user) {
+          gitUser = (user.githubUsername || user.firstName || "VocodeAI Developer").replace(/["$`\\]/g, "");
+          gitEmail = (user.email || "developer@vocodeai.com").replace(/["$`\\]/g, "");
+
+          if (user.githubAccessToken) {
+            const cleanToken = user.githubAccessToken.trim();
+            const ghUser = user.githubUsername ? user.githubUsername.trim().replace(/["$`\\]/g, "") : "x-access-token";
+            gitCreds = `
+# Configure credential helpers globally and system-wide pointing to /etc/git-credentials
+git config --system credential.helper "store --file /etc/git-credentials" 2>/dev/null || true
+git config --global credential.helper "store --file /etc/git-credentials" 2>/dev/null || true
+
+cat << 'EOFCRED' > /etc/git-credentials
+https://${ghUser}:${cleanToken}@github.com
+https://x-access-token:${cleanToken}@github.com
+https://oauth2:${cleanToken}@github.com
+https://${cleanToken}@github.com
+EOFCRED
+chmod 644 /etc/git-credentials 2>/dev/null || true
+
+# Mirror to /root and /workspace to cover all $HOME variants
+cp /etc/git-credentials /root/.git-credentials 2>/dev/null || true
+chmod 600 /root/.git-credentials 2>/dev/null || true
+cp /etc/git-credentials /workspace/.git-credentials 2>/dev/null || true
+chmod 600 /workspace/.git-credentials 2>/dev/null || true
+
+# Rewrite github.com URLs to inject the authenticated user and token automatically
+git config --system url."https://${ghUser}:${cleanToken}@github.com/".insteadOf "https://github.com/" 2>/dev/null || true
+git config --global url."https://${ghUser}:${cleanToken}@github.com/".insteadOf "https://github.com/" 2>/dev/null || true
+`;
+          }
+        }
+      } catch (err) {
+        console.warn("Could not load user for container git configuration:", err.message);
+      }
+    }
+
+    const setupScript = `
+printf '#!/bin/sh\\nclear\\n' > /usr/local/bin/cls
+chmod +x /usr/local/bin/cls
+cat << 'EOF' > /etc/vocode_bashrc
+export HOME=/workspace
+export TERM=xterm-256color
+cd /workspace 2>/dev/null || true
+alias cls='clear'
+alias ll='ls -la --color=auto'
+alias ls='ls --color=auto'
+if [ -f /etc/git-credentials ]; then
+  git config --global credential.helper "store --file /etc/git-credentials" 2>/dev/null || true
+fi
+prompt_func() {
+  local p="\${PWD}"
+  PS1="\\[\\e[32m\\]\${TERM_USER:-user}@vocodeai\\[\\e[0m\\]:\\[\\e[34;1m\\]\${p}\\[\\e[0m\\]\\$ "
+}
+PROMPT_COMMAND=prompt_func
+EOF
+sed -i '/vocode/d' /etc/bash.bashrc 2>/dev/null || true
+sed -i '/vocode/d' /root/.bashrc 2>/dev/null || true
+echo ". /etc/vocode_bashrc" >> /etc/bash.bashrc
+echo ". /etc/vocode_bashrc" >> /root/.bashrc
+
+git config --system --add safe.directory '*' 2>/dev/null || true
+git config --global --add safe.directory '*' 2>/dev/null || true
+git config --system core.filemode false 2>/dev/null || true
+git config --global core.filemode false 2>/dev/null || true
+git config --system init.defaultBranch main 2>/dev/null || true
+git config --global init.defaultBranch main 2>/dev/null || true
+
+cat << 'GITIGNORE_EOF' > /etc/gitignore_global
+# Compiled class and binary files
+*.class
+*.out
+*.o
+*.obj
+*.exe
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dll
+*.dylib
+*.pdb
+*.idb
+*.ilk
+*.map
+a.out
+a.exe
+
+# OS and temporary files
+.DS_Store
+thumbs.db
+.workspace.json
+
+# Dependencies and build outputs
+node_modules/
+dist/
+build/
+__pycache__/
+.venv/
+.pytest_cache/
+GITIGNORE_EOF
+
+git config --system core.excludesfile /etc/gitignore_global 2>/dev/null || true
+git config --global core.excludesfile /etc/gitignore_global 2>/dev/null || true
+
+mkdir -p /etc/git-templates/info 2>/dev/null || true
+cp /etc/gitignore_global /etc/git-templates/info/exclude 2>/dev/null || true
+git config --system init.templateDir /etc/git-templates 2>/dev/null || true
+git config --global init.templateDir /etc/git-templates 2>/dev/null || true
+if [ -n "${gitUser}" ]; then
+  git config --system user.name "${gitUser}" 2>/dev/null || true
+  git config --global user.name "${gitUser}" 2>/dev/null || true
+fi
+if [ -n "${gitEmail}" ]; then
+  git config --system user.email "${gitEmail}" 2>/dev/null || true
+  git config --global user.email "${gitEmail}" 2>/dev/null || true
+fi
+${gitCreds}
+`;
+    const exec = await container.exec({
+      Cmd: ["bash", "-c", setupScript],
+      AttachStdout: true,
+      AttachStderr: true,
+    });
+    const stream = await exec.start({});
+    await new Promise((resolve) => {
+      stream.on("end", resolve);
+      stream.resume();
+    });
+  } catch (err) {
+    // Non-fatal if setup is slightly delayed
+  }
+}
+
+/**
+ * Propagates updated Git credentials across all running Docker containers and active workspace directories for a user.
+ */
+export async function updateGitCredentialsForUser(userId) {
+  if (!userId) return;
+  try {
+    // 1. Update all running containers for this user
+    const containerMap = getAllContainers();
+    const userPrefix = `${String(userId)}-`;
+    for (const [key, entry] of containerMap.entries()) {
+      if (key.startsWith(userPrefix) && entry?.container) {
+        try {
+          await configureContainerEnvironment(entry.container, key);
+        } catch (cErr) {
+          console.warn(`Container credential refresh error for ${key}:`, cErr.message);
+        }
+      }
+    }
+
+    // 2. Update local disk repos
+    const userRoot = path.join(getWorkspacesRoot(), String(userId));
+    if (fs.existsSync(userRoot)) {
+      const items = fs.readdirSync(userRoot);
+      const { ensureGitCredentials } = await import("../controllers/gitController.js");
+      for (const item of items) {
+        const wsPath = path.join(userRoot, item);
+        if (fs.existsSync(path.join(wsPath, ".git"))) {
+          try {
+            await ensureGitCredentials(wsPath, userId);
+          } catch (gErr) {
+            console.warn(`Local git credential refresh error for ${wsPath}:`, gErr.message);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("updateGitCredentialsForUser notice:", err.message);
+  }
+}
+
+const STANDARD_DEV_PORTS = [
+  3000, 3001, 3002, 3003, 3004, 3005,
+  4000, 4001, 4002, 4200,
+  5000, 5001, 5002, 5005,
+  5173, 5174, 5175, 5176,
+  7860,
+  8000, 8001, 8005, 8008, 8080, 8081, 8088,
+  8501,
+  8888,
+  9000, 9001
+];
+
+const RESERVED_HOST_PORTS = new Set([
+  Number(process.env.PORT) || 8000,
+  5173, // Vite Frontend
+  6379, // Redis
+  27017, // MongoDB
+]);
+
+export function detectWorkspacePorts(workspacePath) {
+  const detected = new Set();
+  if (!workspacePath) return Array.from(detected);
+
+  try {
+    const absPath = path.resolve(workspacePath);
+    if (!fs.existsSync(absPath)) return Array.from(detected);
+
+    const scanDir = (dir, depth = 0) => {
+      if (depth > 3) return;
+      let entries = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          if (!["node_modules", ".git", ".venv", "dist", "build", "target", ".idea"].includes(entry.name)) {
+            scanDir(path.join(dir, entry.name), depth + 1);
+          }
+        } else if (entry.isFile()) {
+          const name = entry.name.toLowerCase();
+          const isTarget =
+            name.startsWith(".env") ||
+            name === "package.json" ||
+            name === "pubspec.yaml" ||
+            name === "angular.json" ||
+            name === "application.properties" ||
+            name === "application.yml" ||
+            name === "docker-compose.yml" ||
+            name === "dockerfile" ||
+            name.endsWith(".py") ||
+            name.endsWith(".js") ||
+            name.endsWith(".mjs") ||
+            name.endsWith(".ts");
+
+          if (isTarget) {
+            try {
+              const txt = fs.readFileSync(path.join(dir, entry.name), "utf-8");
+
+              // 1. PORT=... or APP_PORT=... or SERVER_PORT=... or VITE_PORT=...
+              for (const m of txt.matchAll(/(?:PORT|APP_PORT|SERVER_PORT|VITE_PORT)\s*[:=]\s*(\d{2,5})/gi)) {
+                const p = parseInt(m[1], 10);
+                if (p >= 1024 && p <= 65535) detected.add(p);
+              }
+
+              // 2. server.port = ... (Spring Boot properties & yaml)
+              for (const m of txt.matchAll(/server\.port\s*[:=]\s*(\d{2,5})/gi)) {
+                const p = parseInt(m[1], 10);
+                if (p >= 1024 && p <= 65535) detected.add(p);
+              }
+              for (const m of txt.matchAll(/server:\s*\n(?:\s+.*\n)*?\s+port:\s*(\d{2,5})/gi)) {
+                const p = parseInt(m[1], 10);
+                if (p >= 1024 && p <= 65535) detected.add(p);
+              }
+
+              // 3. CLI flags (--port 3000, -p 3000, --web-port 8080)
+              for (const m of txt.matchAll(/(?:--port|-p|--web-port)\s*[= ]\s*(\d{2,5})/gi)) {
+                const p = parseInt(m[1], 10);
+                if (p >= 1024 && p <= 65535) detected.add(p);
+              }
+
+              // 4. Code listen(3000) or app.run(..., port=5000) or uvicorn.run(..., port=8000)
+              for (const m of txt.matchAll(/(?:listen\s*\(\s*|app\.run\s*\([^)]*port\s*=\s*|uvicorn\.run\s*\([^)]*port\s*=\s*|streamlit\s*run.*--server\.port\s*=?\s*)(\d{2,5})/gi)) {
+                const p = parseInt(m[1], 10);
+                if (p >= 1024 && p <= 65535) detected.add(p);
+              }
+
+              // 5. EXPOSE 8080
+              for (const m of txt.matchAll(/EXPOSE\s+(\d{2,5})/gi)) {
+                const p = parseInt(m[1], 10);
+                if (p >= 1024 && p <= 65535) detected.add(p);
+              }
+            } catch {}
+          }
+        }
+      }
+    };
+
+    scanDir(absPath, 0);
+  } catch (err) {
+    console.warn("Could not detect workspace ports:", err.message);
+  }
+
+  return Array.from(detected);
+}
+
+async function getDockerBoundPorts(excludeContainerName) {
+  try {
+    const containers = await docker.listContainers();
+    const bound = new Set();
+    for (const c of containers) {
+      const names = c.Names || [];
+      if (excludeContainerName && names.some((n) => n.replace(/^\//, "") === excludeContainerName)) {
+        continue;
+      }
+      for (const p of c.Ports || []) {
+        if (p.PublicPort) {
+          bound.add(p.PublicPort);
+        }
+      }
+    }
+    return bound;
+  } catch {
+    return new Set();
+  }
+}
+
+function isPortAvailable(port) {
+  if (RESERVED_HOST_PORTS.has(port)) return false;
+  return new Promise((resolve) => {
+    const s4 = net.createServer();
+    s4.once("error", () => resolve(false));
+    s4.once("listening", () => {
+      const s6 = net.createServer();
+      s6.once("error", () => {
+        s4.close();
+        resolve(false);
+      });
+      s6.once("listening", () => {
+        s6.close();
+        s4.close();
+        resolve(true);
+      });
+      s6.listen({ port, host: "::", exclusive: true });
+    });
+    s4.listen({ port, host: "0.0.0.0", exclusive: true });
+  });
+}
+
+export async function cleanupOrphanedContainers(currentKey = null) {
+  try {
+    const currentContainerName = currentKey ? getSanitizedContainerName(currentKey) : null;
+    const containers = await docker.listContainers({ all: true });
+    for (const c of containers) {
+      const name = (c.Names || [])[0]?.replace(/^\//, "") || "";
+      if (name.startsWith("vocodeai-") || name.startsWith("vocodea-")) {
+        if (name !== currentContainerName && c.State !== "running") {
+          try {
+            await docker.getContainer(c.Id).remove({ force: true });
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+}
+
+async function isContainerUsable(inspectData, workspacePath = null) {
+  if (!inspectData || !inspectData.HostConfig) return false;
+  const pb = inspectData.HostConfig.PortBindings || {};
+
+  // Check if any explicitly detected workspace port is missing from PortBindings
+  const neededPorts = workspacePath ? detectWorkspacePorts(workspacePath) : [];
+  for (const p of neededPorts) {
+    const key = `${p}/tcp`;
+    if (!pb[key] || pb[key].length === 0) {
+      return false;
+    }
+    // If this detected port was shifted to an alternative host port (e.g. 3000 -> 3003),
+    // but the 1:1 host port (3000) is now free, container is NOT usable! Force recreate 1:1!
+    const currentHostPort = parseInt(pb[key][0]?.HostPort, 10);
+    if (currentHostPort !== p && !RESERVED_HOST_PORTS.has(p)) {
+      const is1to1Free = await isPortAvailable(p);
+      if (is1to1Free) {
+        console.log(`[CONTAINER RECREATE] Port ${p} is now available on host (was ${currentHostPort}). Recreating container with 1:1 mapping.`);
+        return false;
+      }
+    }
+  }
+
+  // Ensure dev ports are bound
+  const hasDevPort = Object.keys(pb).some((k) => pb[k] && pb[k].length > 0);
+  if (!hasDevPort) return false;
+
+  // Also check standard dev ports (3000, 4200, 5000, 8080):
+  // If any was shifted away, but the standard host port is now available on host, recreate 1:1!
+  for (const p of [3000, 4200, 5000, 8080]) {
+    const key = `${p}/tcp`;
+    if (pb[key] && pb[key][0]) {
+      const currentHostPort = parseInt(pb[key][0].HostPort, 10);
+      if (currentHostPort !== p && !RESERVED_HOST_PORTS.has(p)) {
+        const is1to1Free = await isPortAvailable(p);
+        if (is1to1Free) {
+          console.log(`[CONTAINER RECREATE] Standard port ${p} is now free on host (was shifted to ${currentHostPort}). Recreating container 1:1.`);
+          return false;
+        }
+      }
+    }
+  }
+
+  if (inspectData.State?.Running) {
+    const networks = inspectData.NetworkSettings?.Networks;
+    const ports = inspectData.NetworkSettings?.Ports;
+    if (!networks || Object.keys(networks).length === 0) {
+      return false;
+    }
+    if (!ports || Object.keys(ports).length === 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export async function getAvailableDevPortBindings(workspacePath = null, containerName = null) {
+  const exposedPorts = {};
+  const portBindings = {};
+  const assignedHostPorts = new Set();
+
+  const detectedPorts = workspacePath ? detectWorkspacePorts(workspacePath) : [];
+  const candidatePorts = Array.from(new Set([...detectedPorts, ...STANDARD_DEV_PORTS]));
+
+  const dockerBound = await getDockerBoundPorts(containerName);
+
+  for (const port of candidatePorts) {
+    // If user's project wants port 8000 while host 8000 is occupied by VocodeAI backend:
+    if (port === 8000 && RESERVED_HOST_PORTS.has(8000)) {
+      for (const alt of [8005, 8008, 8085, 8088]) {
+        if (!assignedHostPorts.has(alt) && !dockerBound.has(alt) && (await isPortAvailable(alt))) {
+          exposedPorts["8000/tcp"] = {};
+          portBindings["8000/tcp"] = [{ HostPort: String(alt) }];
+          assignedHostPorts.add(alt);
+          break;
+        }
+      }
+      continue;
+    }
+
+    // If user's project wants port 5173 while host 5173 is occupied by Vite:
+    if (port === 5173 && RESERVED_HOST_PORTS.has(5173)) {
+      for (const alt of [5174, 5175, 5176, 5180]) {
+        if (!assignedHostPorts.has(alt) && !dockerBound.has(alt) && (await isPortAvailable(alt))) {
+          exposedPorts["5173/tcp"] = {};
+          portBindings["5173/tcp"] = [{ HostPort: String(alt) }];
+          assignedHostPorts.add(alt);
+          break;
+        }
+      }
+      continue;
+    }
+
+    if (!assignedHostPorts.has(port) && !dockerBound.has(port) && (await isPortAvailable(port))) {
+      exposedPorts[`${port}/tcp`] = {};
+      portBindings[`${port}/tcp`] = [{ HostPort: String(port) }];
+      assignedHostPorts.add(port);
+    } else if (detectedPorts.includes(port)) {
+      // If a user's specifically detected port is busy on host, find an available alternative host port!
+      for (let offset = 1; offset <= 20; offset++) {
+        const alt = port + offset;
+        if (!assignedHostPorts.has(alt) && !dockerBound.has(alt) && (await isPortAvailable(alt))) {
+          exposedPorts[`${port}/tcp`] = {};
+          portBindings[`${port}/tcp`] = [{ HostPort: String(alt) }];
+          assignedHostPorts.add(alt);
+          break;
+        }
+      }
+    }
+  }
+
+  // Ensure port 5000 is always at least exposed as fallback if not bound
+  if (!exposedPorts["5000/tcp"]) {
+    exposedPorts["5000/tcp"] = {};
+    if (!assignedHostPorts.has(5000) && !dockerBound.has(5000) && (await isPortAvailable(5000))) {
+      portBindings["5000/tcp"] = [{ HostPort: "5000" }];
+      assignedHostPorts.add(5000);
+    }
+  }
+
+  return { exposedPorts, portBindings, detectedPorts };
+}
+
+export async function getWorkspacePortBindings(workspaceKey) {
+  try {
+    const entry = getContainerEntry(workspaceKey);
+    const container = entry?.container || docker.getContainer(getSanitizedContainerName(workspaceKey));
+    if (!container) return [];
+
+    const data = await container.inspect();
+    const ports = data.NetworkSettings?.Ports || data.HostConfig?.PortBindings || {};
+    const result = [];
+
+    for (const [key, bindings] of Object.entries(ports)) {
+      const containerPort = parseInt(key.split("/")[0], 10);
+      if (bindings && bindings.length > 0) {
+        for (const b of bindings) {
+          result.push({
+            containerPort,
+            hostPort: parseInt(b.HostPort, 10),
+            hostUrl: `http://localhost:${b.HostPort}`,
+          });
+        }
+      }
+    }
+    return result;
+  } catch {
+    return [];
+  }
+}
+
+export async function getOrCreateContainer({
+  workspaceKey,
+  workspacePath,
+}) {
+  const containerName = getSanitizedContainerName(workspaceKey);
+
+  // 1. Check in-memory registry first
+  const existing = getContainerEntry(workspaceKey);
+  if (existing) {
+    try {
+      const inspectData = await existing.container.inspect();
+      if (!(await isContainerUsable(inspectData, workspacePath))) {
+        await existing.container.stop({ t: 1 }).catch(() => {});
+        await existing.container.remove({ force: true }).catch(() => {});
+        removeContainer(workspaceKey);
+      } else if (inspectData.State.Running) {
+        touchContainer(workspaceKey);
+        configureContainerEnvironment(existing.container, workspaceKey);
+        return existing.container;
+      } else {
+        await existing.container.start();
+        touchContainer(workspaceKey);
+        configureContainerEnvironment(existing.container, workspaceKey);
+        return existing.container;
+      }
+    } catch {
+      removeContainer(workspaceKey);
+    }
+  }
+
+  // 2. Check if a container with this predictable name already exists in Docker daemon
+  try {
+    const existingDocker = docker.getContainer(containerName);
+    const data = await existingDocker.inspect();
+    if (!(await isContainerUsable(data, workspacePath))) {
+      await existingDocker.stop({ t: 1 }).catch(() => {});
+      await existingDocker.remove({ force: true }).catch(() => {});
+      removeContainer(workspaceKey);
+    } else {
+      if (!data.State.Running) {
+        await existingDocker.start();
+      }
+      registerContainer(workspaceKey, existingDocker);
+      touchContainer(workspaceKey);
+      configureContainerEnvironment(existingDocker, workspaceKey);
+      return existingDocker;
+    }
+  } catch {
+    // Container does not exist yet in Docker daemon
+  }
+
+  // 3. Ensure any conflicting or stopped orphaned container is cleaned up before creating fresh
+  await cleanupOrphanedContainers(workspaceKey);
+  try {
+    const leftover = docker.getContainer(containerName);
+    await leftover.stop({ t: 1 }).catch(() => {});
+    await leftover.remove({ force: true }).catch(() => {});
+  } catch {}
+
+  // 4. Create a fresh container with volume mount and dynamic port forwarding
+  const image = getImageForWorkspace();
+  const absolutePath = path.resolve(workspacePath);
+  const { exposedPorts, portBindings } = await getAvailableDevPortBindings(
+    absolutePath,
+    containerName
+  );
+
+  const container = await docker.createContainer({
+    name: containerName,
+    Image: image,
+    Tty: true,
+    OpenStdin: true,
+    WorkingDir: "/workspace",
+    ExposedPorts: exposedPorts,
+    HostConfig: {
+      Binds: [`${absolutePath}:/workspace`],
+      PortBindings: portBindings,
+      Memory: 1024 * 1024 * 1024,
+      CpuShares: 512,
+      PidsLimit: 256,
+    },
+  });
+
+  await container.start();
+  registerContainer(workspaceKey, container);
+  touchContainer(workspaceKey);
+  configureContainerEnvironment(container, workspaceKey);
+
+  return container;
+}
+
+export async function stopAndRemoveContainer(workspaceKey) {
+  const entry = getContainerEntry(workspaceKey);
+  const container = entry?.container || docker.getContainer(getSanitizedContainerName(workspaceKey));
+
+  if (container) {
+    try {
+      await container.stop({ t: 3 });
+    } catch {}
+
+    try {
+      await container.remove({ force: true });
+    } catch {}
+  }
+
+  removeContainer(workspaceKey);
+}

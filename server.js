@@ -1,0 +1,272 @@
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.join(__dirname, ".env") });
+dotenv.config();
+
+import express from "express";
+import cors from "cors";
+import http from "http";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import cookieParser from "cookie-parser";
+import passport from "./config/passport.js";
+import compression from "compression";
+
+import { connectDB } from "./config/db.js";
+import { isR2Configured, BUCKET_NAME } from "./config/r2.js";
+import authRoutes from "./routes/authRoutes.js";
+import workspaceRoutes from "./routes/workspaceRoutes.js";
+import fileRoutes from "./routes/fileRoutes.js";
+import executeRoutes from "./routes/executeRoutes.js";
+import runRoutes from "./routes/runRoutes.js";
+import statsRoutes from "./routes/statsRoutes.js";
+import jobRoutes from "./routes/jobRoutes.js";
+import aiRoutes from "./routes/aiRoutes.js";
+import gitRoutes from "./routes/gitRoutes.js";
+
+import { setupTerminalServer } from "./terminalServer.js";
+import { startContainerReaper } from "./sandbox/containerReaper.js";
+import { startCodeWorker } from "./workers/codeWorker.js";
+
+const app = express();
+app.set("trust proxy", 1);
+app.use(compression());
+
+/* ================= CORS & SECURITY ================= */
+
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  "http://localhost:5173",
+  "http://localhost:5174",
+  "http://localhost:3000",
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:5174",
+].filter(Boolean);
+
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        frameAncestors: ["'self'", ...allowedOrigins],
+      },
+    },
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  })
+);
+
+// Generous rate limit for active IDE editing actions (saving, reading, navigating)
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 2000,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(globalLimiter);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (
+        allowedOrigins.includes(origin) ||
+        /^http:\/\/localhost:\d+$/.test(origin) ||
+        /^http:\/\/127\.0\.0\.1:\d+$/.test(origin)
+      ) {
+        return callback(null, true);
+      }
+      callback(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    exposedHeaders: ["Content-Disposition"],
+  })
+);
+
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
+app.use(cookieParser());
+app.use(passport.initialize());
+
+/* ================= INIT SERVICES ================= */
+
+connectDB();
+startContainerReaper();
+startCodeWorker();
+
+app.get("/", (req, res) => {
+  const proxyReq = http.request(
+    "http://127.0.0.1:8005/",
+    { method: "GET", timeout: 400 },
+    (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+    }
+  );
+  proxyReq.on("error", () => {
+    res.json({
+      status: "ok",
+      name: "Vocodeai Backend",
+      message: "VocodeAI Backend is running with Docker Container Engine and AI Voice integration",
+    });
+  });
+  proxyReq.on("timeout", () => {
+    proxyReq.destroy();
+    res.json({
+      status: "ok",
+      name: "Vocodeai Backend",
+      message: "VocodeAI Backend is running with Docker Container Engine and AI Voice integration",
+    });
+  });
+  proxyReq.end();
+});
+
+/* ================= UNIVERSAL PROJECT PORT PROXY ================= */
+// Allows previewing and accessing any port (Flask 5000, Spring Boot 8080, Angular 4200, Flutter 8080, Vite, etc.)
+app.use("/proxy/:port", (req, res) => {
+  const targetPort = parseInt(req.params.port, 10);
+  if (isNaN(targetPort) || targetPort < 1024 || targetPort > 65535) {
+    return res.status(400).json({ error: "Invalid port specified" });
+  }
+
+  const subPath = req.url.replace(/^\/?/, "/");
+  let destinationPort = targetPort;
+  if (targetPort === 8000) {
+    destinationPort = 8005;
+  } else if (targetPort === 5173) {
+    destinationPort = 5174;
+  }
+
+  const options = {
+    hostname: "127.0.0.1",
+    port: destinationPort,
+    path: subPath,
+    method: req.method,
+    headers: {
+      ...req.headers,
+      host: `localhost:${destinationPort}`,
+    },
+    timeout: 10000,
+  };
+
+  const proxyReq = http.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on("error", (err) => {
+    res.status(502).json({
+      error: `Could not connect to project server on port ${targetPort}`,
+      message: "Make sure the project is running via '▶ Run Project' in the workspace terminal.",
+      details: err.message,
+    });
+  });
+
+  proxyReq.on("timeout", () => {
+    proxyReq.destroy();
+    res.status(504).json({
+      error: `Gateway timeout connecting to port ${targetPort}`,
+    });
+  });
+
+  req.pipe(proxyReq);
+});
+
+/* ================= ROUTES ================= */
+
+app.use("/api/auth", authRoutes);
+app.use("/api/workspaces", workspaceRoutes);
+app.use("/api/files", fileRoutes);
+app.use("/api/execute", executeRoutes);
+app.use("/api/run", runRoutes);
+app.use("/api/jobs", jobRoutes);
+app.use("/api/stats", statsRoutes);
+app.use("/api/ai", aiRoutes);
+app.use("/api/git", gitRoutes);
+
+/* ================= STATIC WORKSPACE PREVIEW ================= */
+import fs from "fs";
+import FileNode from "./models/FileNode.js";
+import { getWorkspacesRoot } from "./config/paths.js";
+const workspacesDir = getWorkspacesRoot();
+
+// Remove strict CSP and X-Frame-Options for user HTML preview
+app.use("/preview", (req, res, next) => {
+  res.removeHeader("Content-Security-Policy");
+  res.removeHeader("X-Frame-Options");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  next();
+});
+
+// Serve live workspace files from MongoDB FileNode (or disk fallback)
+app.use("/preview/:userId/:workspaceId", async (req, res, next) => {
+  try {
+    const { userId, workspaceId } = req.params;
+    const rawPath = req.path ? req.path.replace(/^[\\\/]+/, "") : "index.html";
+    const cleanPath = decodeURIComponent(rawPath) || "index.html";
+
+    // 1. Try serving from MongoDB FileNode (has latest saved code)
+    const node = await FileNode.findOne({
+      workspaceId,
+      path: cleanPath,
+    }).lean();
+
+    if (node && node.content !== undefined) {
+      if (cleanPath.endsWith(".html") || cleanPath.endsWith(".htm")) {
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+      } else if (cleanPath.endsWith(".css")) {
+        res.setHeader("Content-Type", "text/css; charset=utf-8");
+      } else if (cleanPath.endsWith(".js")) {
+        res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+      } else if (cleanPath.endsWith(".json")) {
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+      } else if (cleanPath.endsWith(".svg")) {
+        res.setHeader("Content-Type", "image/svg+xml");
+      }
+      return res.send(node.content);
+    }
+
+    // 2. Fall back to static file on disk
+    const diskPath = path.join(workspacesDir, String(userId), String(workspaceId), cleanPath);
+    if (fs.existsSync(diskPath) && fs.statSync(diskPath).isFile()) {
+      return res.sendFile(diskPath);
+    }
+
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.use(
+  "/preview",
+  express.static(workspacesDir, {
+    extensions: ["html", "htm"],
+  })
+);
+
+/* ================= ERROR HANDLING ================= */
+app.use((err, req, res, next) => {
+  console.error("Unhandled Backend Error:", err);
+  res.status(err.status || 500).json({
+    error: err.message || "Internal Server Error",
+  });
+});
+
+/* ================= SERVER & WEBSOCKET ================= */
+
+const server = http.createServer(app);
+setupTerminalServer(server);
+
+const PORT = Number(process.env.PORT) || 8000;
+server.listen(PORT, () => {
+  console.log(`🚀 VocodeAI Backend running on http://localhost:${PORT}`);
+  if (isR2Configured) {
+    console.log(`☁️  Cloudflare R2 Storage enabled: Bucket [${BUCKET_NAME}]`);
+  } else {
+    console.log(`⚠️  Cloudflare R2 Storage not configured - running in local-only mode`);
+  }
+});

@@ -1,0 +1,124 @@
+import express from "express";
+import passport from "../config/passport.js";
+import {
+  signup,
+  login,
+  forgotPassword,
+  resetPassword,
+  refreshToken,
+  logout,
+  githubAuth,
+  githubCallback,
+  getGithubStatus,
+  disconnectGithub,
+  connectGithubToken,
+  getProfile,
+  updateProfile,
+  changePassword,
+  getStorageUsage,
+} from "../controllers/authController.js";
+import { generateAccessToken, generateRefreshToken } from "../utils/token.js";
+import { auth } from "../middleware/auth.js";
+
+const router = express.Router();
+
+router.post("/signup", signup);
+router.post("/login", login);
+
+/* ================= GOOGLE OAUTH ================= */
+router.get("/google", (req, res, next) => {
+  const origin =
+    req.query.origin ||
+    req.headers.referer ||
+    process.env.FRONTEND_URL ||
+    "http://localhost:5173";
+  const returnTo = req.query.returnTo || "";
+  const state = Buffer.from(JSON.stringify({ origin, action: "login", returnTo })).toString("base64");
+
+  passport.authenticate("google", {
+    scope: [
+      "profile",
+      "email",
+      "https://www.googleapis.com/auth/cloud-platform",
+      "https://www.googleapis.com/auth/generative-language.retriever",
+    ],
+    prompt: req.query.prompt || "select_account",
+    accessType: "offline",
+    includeGrantedScopes: true,
+    state,
+  })(req, res, next);
+});
+
+router.get(
+  "/google/callback",
+  passport.authenticate("google", { session: false }),
+  async (req, res) => {
+    try {
+      let targetOrigin = process.env.FRONTEND_URL || "http://localhost:5173";
+      let returnTo = "";
+
+      if (req.query.state) {
+        try {
+          const parsed = JSON.parse(Buffer.from(req.query.state, "base64").toString("utf-8"));
+          if (parsed.origin) {
+            targetOrigin = parsed.origin.replace(/\/+$/, "");
+          }
+          if (parsed.returnTo) returnTo = parsed.returnTo;
+        } catch {}
+      }
+
+      const accessToken = generateAccessToken(req.user);
+      const refreshToken = generateRefreshToken(req.user);
+
+      req.user.refreshToken = refreshToken;
+      await req.user.save();
+
+      res.cookie("refreshToken", refreshToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+        path: "/",
+      });
+
+      const userJson = encodeURIComponent(
+        JSON.stringify({
+          id: req.user._id,
+          email: req.user.email,
+          firstName: req.user.firstName,
+          lastName: req.user.lastName,
+          hasGoogleAuth: Boolean(req.user.googleAccessToken || req.user.googleId),
+        })
+      );
+
+      const returnParam = returnTo ? `&returnTo=${encodeURIComponent(returnTo)}` : "";
+
+      res.redirect(
+        `${targetOrigin}/oauth-success?token=${accessToken}&refreshToken=${refreshToken}&user=${userJson}${returnParam}`
+      );
+    } catch (err) {
+      console.error("Google OAuth callback error:", err);
+      res.redirect(
+        `${process.env.FRONTEND_URL || "http://localhost:5173"}/login?error=oauth_failed`
+      );
+    }
+  }
+);
+
+/* ================= GITHUB OAUTH (VS CODE STYLE) ================= */
+router.get("/github", githubAuth);
+router.get("/github/callback", githubCallback);
+router.get("/github/status", auth, getGithubStatus);
+router.post("/github/disconnect", auth, disconnectGithub);
+router.post("/github/connect-token", auth, connectGithubToken);
+
+/* ================= ACCOUNT MANAGEMENT ================= */
+router.get("/profile", auth, getProfile);
+router.put("/profile", auth, updateProfile);
+router.put("/change-password", auth, changePassword);
+router.get("/storage-usage", auth, getStorageUsage);
+router.post("/forgot-password", forgotPassword);
+router.post("/reset-password", resetPassword);
+router.post("/refresh-token", refreshToken);
+router.post("/logout", logout);
+
+export default router;
