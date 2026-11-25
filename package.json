@@ -4,7 +4,7 @@
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "nodemon server.js",
+    "start": "node init && nodemon server.js",
     "worker": "node workers/codeWorker.js"
   },
   "keywords": [],
@@ -36,5 +36,8 @@
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@flydotio/dockerfile": "^0.7.15"
   }
 }
